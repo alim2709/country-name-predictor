@@ -1,21 +1,35 @@
 from datetime import timedelta
-
-from django.db.models.aggregates import Count
 from django.utils import timezone
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework import status
 
+from django.db.models import Count
+
 import httpx
 
 from .models import Name, Country, NameCountryProbability
 from .serializers import NameSerializer
+from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiResponse
 
 NATIONALIZE_API_URL = "https://api.nationalize.io/"
 RESTCOUNTRIES_API_URL = "https://restcountries.com/v3.1/alpha/"
 
 
 class NameCountryAPIView(APIView):
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name="name",
+                type=str,
+                location="query",
+                required=True,
+                description="Name to search",
+            ),
+        ],
+        responses={200: NameSerializer},
+    )
     def get(self, request):
         name_query = request.query_params.get("name")
         if not name_query:
@@ -24,13 +38,14 @@ class NameCountryAPIView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        existing_name = self.get_or_create_name_record(name_query)
-        serializer = NameSerializer(existing_name)
+        result = self.get_or_create_name_record(name_query)
+        if isinstance(result, Response):
+            return result
+        serializer = NameSerializer(result)
         return Response(serializer.data)
 
     def get_or_create_name_record(self, name_query):
         current_time = timezone.now()
-
         existing_name = Name.objects.filter(name__iexact=name_query).first()
         data_is_recent = (
             existing_name is not None
@@ -40,12 +55,10 @@ class NameCountryAPIView(APIView):
 
         if existing_name and data_is_recent:
             self.update_existing_name(existing_name, current_time)
+            return existing_name
         else:
-            existing_name = self.fetch_and_create_name(
-                name_query, current_time, existing_name
-            )
-
-        return existing_name
+            result = self.fetch_and_create_name(name_query, current_time, existing_name)
+            return result
 
     def update_existing_name(self, existing_name, current_time):
         existing_name.count_of_requests += 1
@@ -56,7 +69,7 @@ class NameCountryAPIView(APIView):
         with httpx.Client() as client:
             nationalize_data = self.fetch_nationalize_data(client, name_query)
             if not nationalize_data:
-                raise Response(
+                return Response(
                     {"detail": f"No country predictions for name '{name_query}'."},
                     status=status.HTTP_404_NOT_FOUND,
                 )
@@ -80,11 +93,7 @@ class NameCountryAPIView(APIView):
             NATIONALIZE_API_URL, params={"name": name_query}
         )
         if nationalize_response.status_code != 200:
-            raise Response(
-                {"detail": "Error fetching data from Nationalize.io"},
-                status=status.HTTP_502_BAD_GATEWAY,
-            )
-
+            return None
         return nationalize_response.json().get("country")
 
     def process_country_predictions(self, country_predictions, client, existing_name):
@@ -145,6 +154,39 @@ class NameCountryAPIView(APIView):
 
 
 class PopularNamesAPIView(APIView):
+
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name="country",
+                type=str,
+                location="query",
+                required=True,
+                description="Country code (e.g. US, UA)",
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(
+                response={
+                    "type": "object",
+                    "properties": {
+                        "country": {"type": "string"},
+                        "top_names": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "count_of_requests": {"type": "integer"},
+                                },
+                            },
+                        },
+                    },
+                },
+                description="Top 5 most frequent names for a given country",
+            )
+        },
+    )
     def get(self, request):
         country_code = request.query_params.get("country")
         if not country_code:
